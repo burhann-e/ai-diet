@@ -1,7 +1,7 @@
 import sqlite3
 from datetime import date
 
-DB_PATH = ""/tmp/health_tracker.db""
+DB_PATH = "/tmp/health_tracker.db"
 
 
 def get_connection():
