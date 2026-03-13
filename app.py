@@ -2,6 +2,7 @@ import streamlit as st
 from datetime import date, datetime
 import database as db
 import ai_agent as ai
+import food_db
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -344,78 +345,104 @@ if page == "🏠 Ana Sayfa":
 
 elif page == "🍽️ Yemek Ekle":
     st.markdown("## 🍽️ Yemek Ekle")
-    st.caption("Ne yedin? Hızlıca yaz, kaydet — bitti!")
+    st.caption("Ne yedin? Hızlıca yaz, ara — bitti!")
 
-    with st.form("food_form", clear_on_submit=True):
-        meal_label = st.selectbox("Öğün / Meal", list(MEAL_TYPES.keys()))
+    with st.form("food_form", clear_on_submit=False):
+        meal_label  = st.selectbox("Öğün / Meal", list(MEAL_TYPES.keys()))
         description = st.text_area(
             "Ne yedin? / What did you eat?",
-            placeholder="örn: 2 köfte, pilav, ayran ve biraz salata",
+            placeholder="örn: 2 köfte, 1 kase pilav, 1 bardak ayran",
             height=90,
         )
-        calories = st.number_input(
-            "Kalori (isteğe bağlı — AI tahmin edecek / optional — AI will estimate)",
+        searched = st.form_submit_button("🔍 Ara / Look up", use_container_width=True)
+
+    # ── Lookup phase ───────────────────────────────────────────────────────────
+    if searched:
+        if not description.strip():
+            st.warning("Lütfen ne yediğini yaz!")
+        else:
+            source_spinner = {
+                "local":         None,
+                "openfoodfacts": "Open Food Facts'te aranıyor...",
+                "ai":            "🤖 AI tahmin ediyor...",
+            }
+            with st.spinner("Besin değerleri aranıyor..."):
+                result = food_db.lookup(description.strip())
+
+            if result is None:
+                st.error("Hiçbir kaynakta bulunamadı. Lütfen daha detaylı yazar mısın?")
+            else:
+                st.session_state["pending_food"] = {
+                    "meal_label":  meal_label,
+                    "description": description.strip(),
+                    "result":      result,
+                }
+
+    # ── Confirm phase — shown after lookup, before save ────────────────────────
+    if "pending_food" in st.session_state:
+        pf     = st.session_state["pending_food"]
+        result = pf["result"]
+
+        source_badge = {
+            "local":         "📦 Yerel veritabanı",
+            "openfoodfacts": "🌍 Open Food Facts",
+            "ai":            "🤖 AI tahmini",
+        }.get(result["source"], result["source"])
+
+        conf_icon = {"high": "✅", "medium": "🟡", "low": "⚠️"}.get(result["confidence"], "🟡")
+
+        st.markdown('<div class="section-title">Sonuç — Onaylar mısın?</div>', unsafe_allow_html=True)
+        st.markdown(f"""
+        <div class="metric-card">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem">
+                <span style="font-weight:600">{result['name']}</span>
+                <span style="font-size:0.78rem; color:#888">{source_badge} {conf_icon}</span>
+            </div>
+            <div style="font-size:1.6rem; font-weight:700; color:#F4A261">
+                {result['calories']:.0f} <span style="font-size:0.95rem; font-weight:400; color:#888">kcal</span>
+            </div>
+            <div style="font-size:0.85rem; color:#888; margin-top:0.3rem">
+                {result['portion_label']} &nbsp;·&nbsp;
+                🥩 {result['protein_g']:.0f}g protein &nbsp;·&nbsp;
+                🍞 {result['carbs_g']:.0f}g karb &nbsp;·&nbsp;
+                🧈 {result['fat_g']:.0f}g yağ
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Allow calorie override if she disagrees
+        override_cal = st.number_input(
+            "Kaloriyi düzelt (isteğe bağlı) / Override calories",
             min_value=0,
             max_value=5000,
+            value=int(result["calories"]),
             step=10,
-            value=0,
-            help="Boş bırakabilirsin, AI hesaplar. Biliyorsan gir, AI düzeltir.",
+            help="Hesaplanan değer yanlışsa buradan düzeltebilirsin.",
         )
-        submitted = st.form_submit_button("✅ Kaydet / Save", use_container_width=True)
 
-    if submitted:
-        if not description.strip():
-            st.warning("Lütfen ne yediğini yaz! / Please describe what you ate.")
-        else:
-            meal_type = MEAL_TYPES[meal_label]
-
-            # Save immediately with user-entered calories (may be 0)
-            db.log_food(
-                meal_type=meal_type,
-                description=description.strip(),
-                calories=float(calories) if calories else None,
-            )
-
-            # Get the ID of the row we just inserted
-            today_entries = db.get_food_logs_by_date()
-            last_entry    = today_entries[-1] if today_entries else None
-
-            # AI macro estimation — spinner while it runs
-            with st.spinner("🤖 Besin değerleri hesaplanıyor..."):
-                nutrition = ai.estimate_nutrition(description.strip())
-
-            if last_entry and not nutrition.get("error"):
-                db.update_food_macros(
-                    log_id    = last_entry["id"],
-                    calories  = nutrition["calories"],
-                    protein_g = nutrition["protein_g"],
-                    carbs_g   = nutrition["carbs_g"],
-                    fat_g     = nutrition["fat_g"],
+        col_yes, col_no = st.columns(2)
+        with col_yes:
+            if st.button("✅ Kaydet / Save", use_container_width=True, type="primary"):
+                meal_type = MEAL_TYPES[pf["meal_label"]]
+                db.log_food(
+                    meal_type  = meal_type,
+                    description= pf["description"],
+                    calories   = float(override_cal),
+                    protein_g  = result["protein_g"],
+                    carbs_g    = result["carbs_g"],
+                    fat_g      = result["fat_g"],
                 )
-                conf_icon = {"high": "✅", "medium": "🟡", "low": "⚠️"}.get(nutrition["confidence"], "🟡")
-                st.success(f"Kaydedildi — {nutrition['calories']:.0f} kcal {conf_icon}")
-                if nutrition.get("note"):
-                    st.caption(f"💬 {nutrition['note']}")
+                suspicion = check_suspicious_entry(pf["description"], float(override_cal), meal_type)
+                del st.session_state["pending_food"]
+                st.success(f"Kaydedildi — {override_cal} kcal eklendi.")
+                if suspicion:
+                    st.info(f"💬 {suspicion}")
+                st.rerun()
+        with col_no:
+            if st.button("❌ İptal / Cancel", use_container_width=True):
+                del st.session_state["pending_food"]
+                st.rerun()
 
-                # Show macro breakdown
-                p, c, f = nutrition["protein_g"], nutrition["carbs_g"], nutrition["fat_g"]
-                st.markdown(f"""
-                <div class="metric-card" style="padding:0.6rem 1rem">
-                    <div style="display:flex; gap:1.5rem; font-size:0.88rem">
-                        <span>🥩 Protein <strong>{p:.0f}g</strong></span>
-                        <span>🍞 Karb <strong>{c:.0f}g</strong></span>
-                        <span>🧈 Yağ <strong>{f:.0f}g</strong></span>
-                    </div>
-                </div>""", unsafe_allow_html=True)
-            elif nutrition.get("error"):
-                saved_cal = float(calories) if calories else 0
-                st.success(f"Kaydedildi — {saved_cal:.0f} kcal (AI tahmin başarısız)")
-
-            # Suspicion check — runs after save regardless
-            final_cal = nutrition.get("calories") or float(calories) or 0
-            suspicion = check_suspicious_entry(description.strip(), final_cal, meal_type)
-            if suspicion:
-                st.info(f"💬 {suspicion}")
 
     # Show today's entries below the form
     today_logs = db.get_food_logs_by_date()
