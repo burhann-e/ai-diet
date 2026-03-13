@@ -314,8 +314,8 @@ if page == "🏠 Ana Sayfa":
         st.info("Henüz kilo girişi yok. ⚖️ Kilo Ekle sayfasından başlayabilirsin!")
 
     # ── Crisis / late-night chat ───────────────────────────────────────────────
-    st.markdown('<div class="section-title">🆘 Koça Sor / Ask the Coach</div>', unsafe_allow_html=True)
-    st.caption("Gece acıktın mı? Diyet bunalımında mısın? Yaz, yanıt verelim.")
+    st.markdown('<div class="section-title">🆘 Diyetisyene Sor / Ask the Coach</div>', unsafe_allow_html=True)
+    st.caption("Gece acıktın mı? Dİyet yapmaktan sıkıldın mı? Yaz, yanıt versin.")
 
     crisis_input = st.text_input(
         "",
