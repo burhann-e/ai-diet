@@ -199,19 +199,16 @@ def lookup_single(ingredient: str, quantity: float, unit: str) -> dict:
     if off:
         return {"ingredient": ingredient, "quantity": quantity, "unit": unit, **off}
 
-    # Tier 3: AI — per-unit estimate for this single ingredient
+    # Tier 3: AI — single-item estimate, no re-parsing
     try:
         import ai_agent as ai
-        # Ask AI for just this one ingredient with its quantity
-        components = ai.parse_ingredients(f"{quantity} {unit} {ingredient}")
-        if components and not components[0].get("error"):
-            c = components[0]
-            cal_u  = c["calories_per_unit"]
-            pro_u  = c["protein_per_unit"]
-            carb_u = c["carbs_per_unit"]
-            fat_u  = c["fat_per_unit"]
+        est = ai.estimate_single(ingredient, quantity, unit)
+        if not est.get("error"):
+            cal_u  = est["calories_per_unit"]
+            pro_u  = est["protein_per_unit"]
+            carb_u = est["carbs_per_unit"]
+            fat_u  = est["fat_per_unit"]
 
-            # Cache it (store per-unit as per-100g equivalent using 100g portion)
             _cache_set(cache_key, ingredient,
                        cal_u, pro_u, carb_u, fat_u,
                        100.0, unit, "ai")
@@ -224,13 +221,12 @@ def lookup_single(ingredient: str, quantity: float, unit: str) -> dict:
                 "protein_per_unit":  pro_u,
                 "carbs_per_unit":    carb_u,
                 "fat_per_unit":      fat_u,
-                # Python does the multiplication
                 "calories":  round(cal_u  * quantity, 1),
                 "protein_g": round(pro_u  * quantity, 1),
                 "carbs_g":   round(carb_u * quantity, 1),
                 "fat_g":     round(fat_u  * quantity, 1),
                 "source":    "ai",
-                "confidence":c.get("confidence", "medium"),
+                "confidence":est.get("confidence", "medium"),
             }
     except Exception:
         pass

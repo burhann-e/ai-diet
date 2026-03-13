@@ -49,109 +49,153 @@ def _parse_json(text: str) -> dict:
 
 # ── 1. Ingredient parsing + per-unit estimation ───────────────────────────────
 
-PARSE_SYSTEM = """
-Sen bir diyetisyen asistanısın. Kullanıcı Türkçe bir yemek listesi yazar.
-Görevin: her malzemeyi ayrı ayrı tanımla ve BİRİM BAŞINA besin değerlerini ver.
+PARSE_SYSTEM = """Sen bir diyetisyen asistanısın. Türkçe yemek listesini malzeme malzeme ayır, BİRİM BAŞINA besin değerlerini ver.
 
-KESİN KURALLAR:
-- Her malzemeyi ayrı bir JSON objesine koy
-- "calories_per_unit" = 1 birim için kalori (TOPLAM DEĞİL)
-- Miktar belirsizse ("biraz", "birkaç") makul bir birim varsay ve belirt
-- Hiçbir toplam hesaplama yapma — sadece birim başına değer ver
-- Türk mutfağını iyi biliyorsun (köfte, pilav, börek, çorba, zeytin vs.)
-- Asla 0 verme — her zaman makul bir tahmin yap
-- Sadece JSON array dön, başka hiçbir şey yazma
+KURALLAR:
+- Her malzeme ayrı JSON objesi
+- calories_per_unit = SADECE 1 birim için kalori, çarpma YAPMA
+- "biraz" = makul küçük porsiyon varsay
+- Asla 0 verme
+- Sadece JSON array yaz, başka hiçbir şey ekleme, markdown kullanma
 
-ÇIKTI FORMATI (kesinlikle bu yapıda, array):
-[
-  {
-    "ingredient": "yumurta",
-    "quantity": 2,
-    "unit": "adet",
-    "calories_per_unit": 78,
-    "protein_per_unit": 6.3,
-    "carbs_per_unit": 0.6,
-    "fat_per_unit": 5.3,
-    "confidence": "high"
-  },
-  {
-    "ingredient": "beyaz peynir",
-    "quantity": 1,
-    "unit": "dilim (30g)",
-    "calories_per_unit": 80,
-    "protein_per_unit": 4.2,
-    "carbs_per_unit": 1.2,
-    "fat_per_unit": 6.3,
-    "confidence": "medium"
-  }
-]
-"""
+ÖRNEK ÇIKTI:
+[{"ingredient":"yumurta","quantity":2,"unit":"adet","calories_per_unit":78,"protein_per_unit":6.3,"carbs_per_unit":0.6,"fat_per_unit":5.3,"confidence":"high"},{"ingredient":"beyaz peynir","quantity":1,"unit":"dilim","calories_per_unit":80,"protein_per_unit":4.2,"carbs_per_unit":1.2,"fat_per_unit":6.3,"confidence":"medium"}]"""
+
+SINGLE_ESTIMATE_SYSTEM = """Sen bir diyetisyen asistanısın. Verilen tek malzeme için BİRİM BAŞINA besin değeri ver.
+
+Sadece tek bir JSON objesi döndür, markdown veya açıklama ekleme:
+{"calories_per_unit":78,"protein_per_unit":6.3,"carbs_per_unit":0.6,"fat_per_unit":5.3,"confidence":"high"}"""
+
+
+def _robust_parse_array(text: str) -> list | None:
+    """
+    Tries multiple strategies to extract a JSON array from model output.
+    Returns list or None if all strategies fail.
+    """
+    # Strategy 1: strip fences, direct parse
+    cleaned = re.sub(r"```(?:json)?|```", "", text).strip()
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("items", "ingredients", "malzemeler", "foods", "data"):
+                if isinstance(data.get(key), list):
+                    return data[key]
+            return [data]
+    except Exception:
+        pass
+
+    # Strategy 2: extract first [...] block from text
+    m = re.search(r"\[.*\]", cleaned, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            if isinstance(data, list):
+                return data
+        except Exception:
+            pass
+
+    return None
+
 
 def parse_ingredients(description: str) -> list[dict]:
     """
-    Parses a free-text meal description into a list of components.
-    Each component has per-unit values only — app does all multiplication.
-
-    Returns list of dicts with keys:
-        ingredient, quantity, unit,
-        calories_per_unit, protein_per_unit, carbs_per_unit, fat_per_unit,
-        confidence
-    Falls back to a single-item list on any error.
+    Parses free-text meal into components. Each has per-unit values only.
+    App does all multiplication. Never returns empty list.
     """
     try:
-        raw  = _call(FLASH, PARSE_SYSTEM, description, json_mode=True)
-        data = _parse_json(raw)
+        # Use text/plain — more reliable than json_mode for arrays
+        raw  = _call(FLASH, PARSE_SYSTEM, description, json_mode=False)
+        data = _robust_parse_array(raw)
 
-        # Accept both a bare array and {"items": [...]}
-        if isinstance(data, dict):
-            data = data.get("items") or data.get("ingredients") or [data]
+        if not data:
+            return _fallback_single(description, error=f"Parse failed: {raw[:120]}")
 
         validated = []
         for item in data:
+            if not isinstance(item, dict):
+                continue
+            cal = float(item.get("calories_per_unit") or 0)
+            if cal == 0:
+                continue   # skip empty rows — don't add zero-calorie noise
             validated.append({
-                "ingredient":       str(item.get("ingredient", "bilinmeyen")),
-                "quantity":         float(item.get("quantity") or 1),
-                "unit":             str(item.get("unit", "porsiyon")),
-                "calories_per_unit":float(item.get("calories_per_unit") or 0),
-                "protein_per_unit": float(item.get("protein_per_unit")  or 0),
-                "carbs_per_unit":   float(item.get("carbs_per_unit")    or 0),
-                "fat_per_unit":     float(item.get("fat_per_unit")      or 0),
-                "confidence":       str(item.get("confidence", "medium")),
+                "ingredient":        str(item.get("ingredient", "bilinmeyen")),
+                "quantity":          float(item.get("quantity") or 1),
+                "unit":              str(item.get("unit", "porsiyon")),
+                "calories_per_unit": cal,
+                "protein_per_unit":  float(item.get("protein_per_unit")  or 0),
+                "carbs_per_unit":    float(item.get("carbs_per_unit")    or 0),
+                "fat_per_unit":      float(item.get("fat_per_unit")      or 0),
+                "confidence":        str(item.get("confidence", "medium")),
             })
-        return validated if validated else _fallback_single(description)
+        return validated if validated else _fallback_single(description, error="All items were zero")
 
     except Exception as e:
         return _fallback_single(description, error=str(e))
 
 
+def estimate_single(ingredient: str, quantity: float, unit: str) -> dict:
+    """
+    Estimates nutrition for ONE ingredient only.
+    Used by food_db.lookup_single() as the AI tier — no re-parsing.
+    Returns per-unit values; caller multiplies by quantity.
+    """
+    prompt = f"{quantity} {unit} {ingredient}"
+    try:
+        raw     = _call(FLASH, SINGLE_ESTIMATE_SYSTEM, prompt, json_mode=False)
+        cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
+        # Extract first {...} block
+        m = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if m:
+            data = json.loads(m.group(0))
+            return {
+                "calories_per_unit": float(data.get("calories_per_unit") or 0),
+                "protein_per_unit":  float(data.get("protein_per_unit")  or 0),
+                "carbs_per_unit":    float(data.get("carbs_per_unit")    or 0),
+                "fat_per_unit":      float(data.get("fat_per_unit")      or 0),
+                "confidence":        str(data.get("confidence", "medium")),
+                "error":             False,
+            }
+    except Exception:
+        pass
+    return {
+        "calories_per_unit": 0.0,
+        "protein_per_unit":  0.0,
+        "carbs_per_unit":    0.0,
+        "fat_per_unit":      0.0,
+        "confidence":        "low",
+        "error":             True,
+    }
+
+
 def _fallback_single(description: str, error: str = "") -> list[dict]:
-    """Single-item fallback when parsing completely fails."""
+    """Single zero-value fallback so the app never crashes."""
     return [{
-        "ingredient":       description,
-        "quantity":         1,
-        "unit":             "porsiyon",
-        "calories_per_unit":0.0,
-        "protein_per_unit": 0.0,
-        "carbs_per_unit":   0.0,
-        "fat_per_unit":     0.0,
-        "confidence":       "low",
-        "error":            error or True,
+        "ingredient":        description,
+        "quantity":          1,
+        "unit":              "porsiyon",
+        "calories_per_unit": 0.0,
+        "protein_per_unit":  0.0,
+        "carbs_per_unit":    0.0,
+        "fat_per_unit":      0.0,
+        "confidence":        "low",
+        "error":             error or True,
     }]
 
 
 def estimate_nutrition(description: str) -> dict:
-    """
-    Legacy single-total interface kept for ai_agent internal use only.
-    Sums the component breakdown — math done in Python, not by the LLM.
-    """
+    """Kept for compatibility. Sums parse_ingredients — math in Python."""
     components = parse_ingredients(description)
-    calories  = sum(c["calories_per_unit"]  * c["quantity"] for c in components)
-    protein_g = sum(c["protein_per_unit"]   * c["quantity"] for c in components)
-    carbs_g   = sum(c["carbs_per_unit"]     * c["quantity"] for c in components)
-    fat_g     = sum(c["fat_per_unit"]       * c["quantity"] for c in components)
+    calories   = sum(c["calories_per_unit"]  * c["quantity"] for c in components)
+    protein_g  = sum(c["protein_per_unit"]   * c["quantity"] for c in components)
+    carbs_g    = sum(c["carbs_per_unit"]     * c["quantity"] for c in components)
+    fat_g      = sum(c["fat_per_unit"]       * c["quantity"] for c in components)
     has_error  = any(c.get("error") for c in components)
-    confidence = "low" if has_error else (
-        "high" if all(c["confidence"] == "high" for c in components) else "medium"
+    confidence = (
+        "low"  if has_error else
+        "high" if all(c["confidence"] == "high" for c in components) else
+        "medium"
     )
     return {
         "calories":   round(calories,  1),
