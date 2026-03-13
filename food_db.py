@@ -1,25 +1,30 @@
 """
-food_db.py — 3-tier food lookup with persistent Supabase cache.
+food_db.py — Per-ingredient lookup with persistent Supabase cache.
 
-Tier 1: Supabase food_cache table   — instant, free after first lookup
-Tier 2: Open Food Facts API         — free, no key, real nutritional data
-Tier 3: Gemini Flash via ai_agent   — last resort, costs tokens
+Flow for a single ingredient:
+  Tier 1: Supabase food_cache   → instant, free after first hit
+  Tier 2: Open Food Facts       → free, real data, writes to cache
+  Tier 3: ai_agent.parse_ingredients → last resort, writes to cache
 
-Tiers 2 and 3 both write to food_cache on success,
-so the same food is never looked up twice.
+lookup_multi(description)  — main entry point for multi-ingredient meals
+lookup_single(ingredient)  — looks up one ingredient through all 3 tiers
 
-All tiers return the same shape:
+Each result item shape:
 {
-    "name":          str,
-    "calories":      float,   # for the resolved portion
-    "protein_g":     float,
-    "carbs_g":       float,
-    "fat_g":         float,
-    "portion_label": str,     # e.g. "2 adet", "1 kase"
-    "source":        str,     # "cache" | "openfoodfacts" | "ai"
-    "confidence":    str,     # "high" | "medium" | "low"
+    "ingredient":   str,
+    "quantity":     float,
+    "unit":         str,
+    "calories":     float,   # quantity × per_unit  (Python math, not LLM)
+    "protein_g":    float,
+    "carbs_g":      float,
+    "fat_g":        float,
+    "calories_per_unit": float,
+    "protein_per_unit":  float,
+    "carbs_per_unit":    float,
+    "fat_per_unit":      float,
+    "source":       str,     # "cache" | "openfoodfacts" | "ai"
+    "confidence":   str,
 }
-Returns None only if all 3 tiers fail.
 """
 
 import re
@@ -27,13 +32,9 @@ import requests
 import streamlit as st
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Normalisation helpers ─────────────────────────────────────────────────────
 
 def _normalize(text: str) -> str:
-    """
-    Lowercase, strip Turkish chars, remove punctuation, collapse spaces.
-    Used as the cache key so 'Yumurta', 'yumurta', 'yumurtalı' all map cleanly.
-    """
     text = text.lower().strip()
     for tr, en in {"ç":"c","ğ":"g","ı":"i","ö":"o","ş":"s","ü":"u"}.items():
         text = text.replace(tr, en)
@@ -41,60 +42,38 @@ def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _parse_quantity(description: str) -> float:
-    """Extract leading number. '2 yumurta' → 2.0. Defaults to 1.0."""
-    m = re.match(r"^\s*(\d+(?:[.,]\d+)?)", description)
-    return float(m.group(1).replace(",", ".")) if m else 1.0
+def _parse_quantity(text: str) -> tuple[float, str]:
+    """Returns (quantity, remainder_without_number)."""
+    m = re.match(r"^\s*(\d+(?:[.,]\d+)?)\s*(.*)", text)
+    if m:
+        return float(m.group(1).replace(",", ".")), m.group(2).strip()
+    return 1.0, text.strip()
 
 
-def _strip_quantity(description: str) -> str:
-    """Remove leading number for cleaner search queries."""
-    return re.sub(r"^\s*\d+[.,]?\d*\s*", "", description).strip() or description
-
-
-def _scale(row: dict, quantity: float) -> dict:
-    """
-    Scale per-100g cache values by (quantity × portion_grams / 100).
-    Returns the full result dict.
-    """
-    factor = (quantity * (row["portion_grams"] or 100)) / 100.0
-    return {
-        "name":          row["name"],
-        "calories":      round(row["calories_100g"]  * factor, 1),
-        "protein_g":     round(row["protein_100g"]   * factor, 1),
-        "carbs_g":       round(row["carbs_100g"]     * factor, 1),
-        "fat_g":         round(row["fat_100g"]       * factor, 1),
-        "portion_label": f"{quantity:.0f} {row['portion_label'] or 'porsiyon'}",
-        "source":        "cache",
-        "confidence":    "high",
-    }
-
+# ── Supabase client (reused from database.py) ─────────────────────────────────
 
 def _db():
-    """Reuse the Supabase client from database.py."""
     from database import _db as db_client
     return db_client()
 
 
-# ── Cache read/write ──────────────────────────────────────────────────────────
+# ── Cache read / write ────────────────────────────────────────────────────────
 
-def _cache_get(query_key: str) -> dict | None:
+def _cache_get(key: str) -> dict | None:
     res = (
         _db().table("food_cache")
         .select("*")
-        .eq("query_key", query_key)
+        .eq("query_key", key)
         .limit(1)
         .execute()
     )
     return res.data[0] if res.data else None
 
 
-def _cache_set(query_key: str, name: str, cal: float, pro: float,
-               carb: float, fat: float, portion_g: float,
-               portion_label: str, source: str):
+def _cache_set(key, name, cal, pro, carb, fat, portion_g, portion_label, source):
     try:
         _db().table("food_cache").upsert({
-            "query_key":     query_key,
+            "query_key":     key,
             "name":          name,
             "calories_100g": cal,
             "protein_100g":  pro,
@@ -105,29 +84,36 @@ def _cache_set(query_key: str, name: str, cal: float, pro: float,
             "source":        source,
         }).execute()
     except Exception:
-        pass   # cache write failure should never crash the app
+        pass   # cache miss should never crash the app
 
 
-# ── Tier 1: Supabase cache ────────────────────────────────────────────────────
-
-def lookup_cache(description: str) -> dict | None:
-    quantity  = _parse_quantity(description)
-    query_key = _normalize(_strip_quantity(description))
-    row       = _cache_get(query_key)
-    if row:
-        return _scale(row, quantity)
-    return None
+def _row_to_per_unit(row: dict, quantity: float) -> dict:
+    """Scale cached per-100g values → per-unit, then multiply by quantity in Python."""
+    portion_g = row.get("portion_grams") or 100.0
+    # per-unit values (1 adet / 1 kase / 1 dilim)
+    factor_unit = portion_g / 100.0
+    cal_u  = round(row["calories_100g"] * factor_unit, 1)
+    pro_u  = round(row["protein_100g"]  * factor_unit, 1)
+    carb_u = round(row["carbs_100g"]    * factor_unit, 1)
+    fat_u  = round(row["fat_100g"]      * factor_unit, 1)
+    return {
+        "calories_per_unit": cal_u,
+        "protein_per_unit":  pro_u,
+        "carbs_per_unit":    carb_u,
+        "fat_per_unit":      fat_u,
+        # totals — Python math only
+        "calories":  round(cal_u  * quantity, 1),
+        "protein_g": round(pro_u  * quantity, 1),
+        "carbs_g":   round(carb_u * quantity, 1),
+        "fat_g":     round(fat_u  * quantity, 1),
+    }
 
 
 # ── Tier 2: Open Food Facts ───────────────────────────────────────────────────
 
 OFF_URL = "https://world.openfoodfacts.org/cgi/search.pl"
 
-def lookup_openfoodfacts(description: str) -> dict | None:
-    quantity  = _parse_quantity(description)
-    query     = _strip_quantity(description)
-    query_key = _normalize(query)
-
+def _off_lookup(query: str, quantity: float, cache_key: str) -> dict | None:
     try:
         params = {
             "search_terms":  query,
@@ -140,9 +126,8 @@ def lookup_openfoodfacts(description: str) -> dict | None:
         }
         resp = requests.get(OFF_URL, params=params, timeout=6)
         resp.raise_for_status()
-        data = resp.json()
 
-        for product in data.get("products", []):
+        for product in resp.json().get("products", []):
             n   = product.get("nutriments", {})
             cal = n.get("energy-kcal_100g") or n.get("energy_100g")
             if not cal:
@@ -153,7 +138,6 @@ def lookup_openfoodfacts(description: str) -> dict | None:
             carb_100g = float(n.get("carbohydrates_100g") or 0)
             fat_100g  = float(n.get("fat_100g")            or 0)
 
-            # Serving size from product, fallback to 100g
             portion_g = 100.0
             m = re.search(r"(\d+(?:[.,]\d+)?)\s*g",
                           product.get("serving_size", ""))
@@ -161,78 +145,183 @@ def lookup_openfoodfacts(description: str) -> dict | None:
                 portion_g = float(m.group(1).replace(",", "."))
 
             name = product.get("product_name") or query
-
-            # Write to cache
-            _cache_set(query_key, name, cal_100g, pro_100g, carb_100g,
+            _cache_set(cache_key, name, cal_100g, pro_100g, carb_100g,
                        fat_100g, portion_g, "porsiyon", "openfoodfacts")
 
-            factor = (quantity * portion_g) / 100.0
+            factor_unit = portion_g / 100.0
+            cal_u  = round(cal_100g  * factor_unit, 1)
+            pro_u  = round(pro_100g  * factor_unit, 1)
+            carb_u = round(carb_100g * factor_unit, 1)
+            fat_u  = round(fat_100g  * factor_unit, 1)
             return {
-                "name":          name,
-                "calories":      round(cal_100g  * factor, 1),
-                "protein_g":     round(pro_100g  * factor, 1),
-                "carbs_g":       round(carb_100g * factor, 1),
-                "fat_g":         round(fat_100g  * factor, 1),
-                "portion_label": f"{quantity:.0f} × {portion_g:.0f}g",
-                "source":        "openfoodfacts",
-                "confidence":    "medium",
+                "calories_per_unit": cal_u,
+                "protein_per_unit":  pro_u,
+                "carbs_per_unit":    carb_u,
+                "fat_per_unit":      fat_u,
+                "calories":  round(cal_u  * quantity, 1),
+                "protein_g": round(pro_u  * quantity, 1),
+                "carbs_g":   round(carb_u * quantity, 1),
+                "fat_g":     round(fat_u  * quantity, 1),
+                "name":      name,
+                "source":    "openfoodfacts",
+                "confidence":"medium",
             }
-
     except Exception:
         pass
-
     return None
 
 
-# ── Tier 3: AI fallback ───────────────────────────────────────────────────────
+# ── Single-ingredient lookup ──────────────────────────────────────────────────
 
-def lookup_ai(description: str) -> dict | None:
-    quantity  = _parse_quantity(description)
-    query     = _strip_quantity(description)
-    query_key = _normalize(query)
+def lookup_single(ingredient: str, quantity: float, unit: str) -> dict:
+    """
+    Looks up one ingredient through cache → OFF → AI.
+    Always returns a result dict (never None) — caller decides what to do
+    if confidence is 'low' and error is True.
+    """
+    cache_key = _normalize(ingredient)
 
+    # Tier 1: cache
+    row = _cache_get(cache_key)
+    if row:
+        vals = _row_to_per_unit(row, quantity)
+        return {
+            "ingredient": ingredient,
+            "quantity":   quantity,
+            "unit":       unit,
+            "source":     "cache",
+            "confidence": "high",
+            **vals,
+        }
+
+    # Tier 2: Open Food Facts
+    off = _off_lookup(ingredient, quantity, cache_key)
+    if off:
+        return {"ingredient": ingredient, "quantity": quantity, "unit": unit, **off}
+
+    # Tier 3: AI — per-unit estimate for this single ingredient
     try:
         import ai_agent as ai
-        result = ai.estimate_nutrition(description)
-        if result.get("error"):
-            return None
+        # Ask AI for just this one ingredient with its quantity
+        components = ai.parse_ingredients(f"{quantity} {unit} {ingredient}")
+        if components and not components[0].get("error"):
+            c = components[0]
+            cal_u  = c["calories_per_unit"]
+            pro_u  = c["protein_per_unit"]
+            carb_u = c["carbs_per_unit"]
+            fat_u  = c["fat_per_unit"]
 
-        # Back-calculate per-100g values from the total estimate
-        # AI returns values for the full description (including quantity)
-        # We store per-100g so future lookups with different quantities work
-        portion_g  = 100.0
-        divisor    = quantity if quantity > 0 else 1.0
-        cal_100g   = result["calories"]  / divisor
-        pro_100g   = result["protein_g"] / divisor
-        carb_100g  = result["carbs_g"]   / divisor
-        fat_100g   = result["fat_g"]     / divisor
+            # Cache it (store per-unit as per-100g equivalent using 100g portion)
+            _cache_set(cache_key, ingredient,
+                       cal_u, pro_u, carb_u, fat_u,
+                       100.0, unit, "ai")
 
-        _cache_set(query_key, query, cal_100g, pro_100g, carb_100g,
-                   fat_100g, portion_g, "porsiyon", "ai")
-
-        return {
-            "name":          query,
-            "calories":      result["calories"],
-            "protein_g":     result["protein_g"],
-            "carbs_g":       result["carbs_g"],
-            "fat_g":         result["fat_g"],
-            "portion_label": description,
-            "source":        "ai",
-            "confidence":    result.get("confidence", "medium"),
-        }
+            return {
+                "ingredient":        ingredient,
+                "quantity":          quantity,
+                "unit":              unit,
+                "calories_per_unit": cal_u,
+                "protein_per_unit":  pro_u,
+                "carbs_per_unit":    carb_u,
+                "fat_per_unit":      fat_u,
+                # Python does the multiplication
+                "calories":  round(cal_u  * quantity, 1),
+                "protein_g": round(pro_u  * quantity, 1),
+                "carbs_g":   round(carb_u * quantity, 1),
+                "fat_g":     round(fat_u  * quantity, 1),
+                "source":    "ai",
+                "confidence":c.get("confidence", "medium"),
+            }
     except Exception:
-        return None
+        pass
+
+    # All tiers failed
+    return {
+        "ingredient":        ingredient,
+        "quantity":          quantity,
+        "unit":              unit,
+        "calories_per_unit": 0.0,
+        "protein_per_unit":  0.0,
+        "carbs_per_unit":    0.0,
+        "fat_per_unit":      0.0,
+        "calories":  0.0,
+        "protein_g": 0.0,
+        "carbs_g":   0.0,
+        "fat_g":     0.0,
+        "source":    "unknown",
+        "confidence":"low",
+        "error":     True,
+    }
 
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Multi-ingredient entry point ──────────────────────────────────────────────
 
-def lookup(description: str) -> dict | None:
+def lookup_multi(description: str) -> list[dict]:
     """
-    Main entry point. Tries all 3 tiers silently.
-    Returns None only if all 3 fail.
+    Main entry point.
+
+    1. AI parses the free-text description into components (ingredient + quantity + unit)
+    2. Each component is looked up individually via lookup_single()
+    3. Returns list of per-ingredient result dicts
+    4. Caller (app.py) sums totals in Python — no LLM arithmetic
+
+    If user has manually edited the ingredient list (passed as list[str]),
+    each string is parsed for a leading number, then looked up.
     """
-    return (
-        lookup_cache(description)
-        or lookup_openfoodfacts(description)
-        or lookup_ai(description)
-    )
+    import ai_agent as ai
+
+    # Step 1: parse into components
+    components = ai.parse_ingredients(description)
+
+    # Step 2: look up each component individually
+    results = []
+    for c in components:
+        result = lookup_single(
+            ingredient = c["ingredient"],
+            quantity   = c["quantity"],
+            unit       = c["unit"],
+        )
+        results.append(result)
+
+    return results
+
+
+def lookup_multi_from_list(ingredient_lines: list[str]) -> list[dict]:
+    """
+    Used when the user has manually split/edited the ingredient list.
+    Each line is a free-text ingredient string like "2 yumurta" or "biraz peynir".
+    Parses quantity from leading number, looks up the rest.
+    """
+    import ai_agent as ai
+
+    results = []
+    for line in ingredient_lines:
+        line = line.strip()
+        if not line:
+            continue
+        quantity, remainder = _parse_quantity(line)
+        # Use AI to get unit for ambiguous items, or just use "porsiyon"
+        components = ai.parse_ingredients(line)
+        if components and not components[0].get("error"):
+            c = components[0]
+            result = lookup_single(c["ingredient"], c["quantity"], c["unit"])
+        else:
+            result = lookup_single(remainder or line, quantity, "porsiyon")
+        results.append(result)
+
+    return results
+
+
+# ── App-level math (called by app.py, never by LLM) ──────────────────────────
+
+def sum_components(components: list[dict]) -> dict:
+    """
+    Pure Python sum of a components list.
+    This is the ONLY place totals are calculated.
+    """
+    return {
+        "calories":  round(sum(c["calories"]  for c in components), 1),
+        "protein_g": round(sum(c["protein_g"] for c in components), 1),
+        "carbs_g":   round(sum(c["carbs_g"]   for c in components), 1),
+        "fat_g":     round(sum(c["fat_g"]      for c in components), 1),
+    }

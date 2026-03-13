@@ -21,8 +21,8 @@ def _client():
     return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 
-FLASH = "gemini-2.5-flash"
-PRO   = "gemini-2.5-flash"
+FLASH = "gemini-2.0-flash"
+PRO   = "gemini-2.5-pro-preview-06-05"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -47,57 +47,122 @@ def _parse_json(text: str) -> dict:
     return json.loads(cleaned)
 
 
-# ── 1. Calorie & macro estimation ─────────────────────────────────────────────
+# ── 1. Ingredient parsing + per-unit estimation ───────────────────────────────
 
-NUTRITION_SYSTEM = """
-Sen bir diyetisyen asistanısın. Kullanıcı Türkçe yemek tarifi veya yediklerini yazar.
-Görüün: porsiyon büyüklüğü dahil kalori ve makro besin değerlerini tahmin et.
+PARSE_SYSTEM = """
+Sen bir diyetisyen asistanısın. Kullanıcı Türkçe bir yemek listesi yazar.
+Görevin: her malzemeyi ayrı ayrı tanımla ve BİRİM BAŞINA besin değerlerini ver.
 
-KURALLAR:
-- Türk mutfağını iyi biliyorsun (köfte, pilav, börek, çorba, vs.)
-- Eğer miktar belirsizse (örn. "biraz", "bir tabak") makul bir porsiyon varsay
-- Asla 0 döndürme — her zaman makul bir tahmin ver
-- Sadece JSON dön, başka hiçbir şey yazma
+KESİN KURALLAR:
+- Her malzemeyi ayrı bir JSON objesine koy
+- "calories_per_unit" = 1 birim için kalori (TOPLAM DEĞİL)
+- Miktar belirsizse ("biraz", "birkaç") makul bir birim varsay ve belirt
+- Hiçbir toplam hesaplama yapma — sadece birim başına değer ver
+- Türk mutfağını iyi biliyorsun (köfte, pilav, börek, çorba, zeytin vs.)
+- Asla 0 verme — her zaman makul bir tahmin yap
+- Sadece JSON array dön, başka hiçbir şey yazma
 
-ÇIKTI FORMATI (kesinlikle bu yapıda):
-{
-  "calories": 450,
-  "protein_g": 28,
-  "carbs_g": 42,
-  "fat_g": 14,
-  "confidence": "high" | "medium" | "low",
-  "note": "Porsiyon belirsizdi, orta boy tabak varsayıldı."
-}
+ÇIKTI FORMATI (kesinlikle bu yapıda, array):
+[
+  {
+    "ingredient": "yumurta",
+    "quantity": 2,
+    "unit": "adet",
+    "calories_per_unit": 78,
+    "protein_per_unit": 6.3,
+    "carbs_per_unit": 0.6,
+    "fat_per_unit": 5.3,
+    "confidence": "high"
+  },
+  {
+    "ingredient": "beyaz peynir",
+    "quantity": 1,
+    "unit": "dilim (30g)",
+    "calories_per_unit": 80,
+    "protein_per_unit": 4.2,
+    "carbs_per_unit": 1.2,
+    "fat_per_unit": 6.3,
+    "confidence": "medium"
+  }
+]
 """
+
+def parse_ingredients(description: str) -> list[dict]:
+    """
+    Parses a free-text meal description into a list of components.
+    Each component has per-unit values only — app does all multiplication.
+
+    Returns list of dicts with keys:
+        ingredient, quantity, unit,
+        calories_per_unit, protein_per_unit, carbs_per_unit, fat_per_unit,
+        confidence
+    Falls back to a single-item list on any error.
+    """
+    try:
+        raw  = _call(FLASH, PARSE_SYSTEM, description, json_mode=True)
+        data = _parse_json(raw)
+
+        # Accept both a bare array and {"items": [...]}
+        if isinstance(data, dict):
+            data = data.get("items") or data.get("ingredients") or [data]
+
+        validated = []
+        for item in data:
+            validated.append({
+                "ingredient":       str(item.get("ingredient", "bilinmeyen")),
+                "quantity":         float(item.get("quantity") or 1),
+                "unit":             str(item.get("unit", "porsiyon")),
+                "calories_per_unit":float(item.get("calories_per_unit") or 0),
+                "protein_per_unit": float(item.get("protein_per_unit")  or 0),
+                "carbs_per_unit":   float(item.get("carbs_per_unit")    or 0),
+                "fat_per_unit":     float(item.get("fat_per_unit")      or 0),
+                "confidence":       str(item.get("confidence", "medium")),
+            })
+        return validated if validated else _fallback_single(description)
+
+    except Exception as e:
+        return _fallback_single(description, error=str(e))
+
+
+def _fallback_single(description: str, error: str = "") -> list[dict]:
+    """Single-item fallback when parsing completely fails."""
+    return [{
+        "ingredient":       description,
+        "quantity":         1,
+        "unit":             "porsiyon",
+        "calories_per_unit":0.0,
+        "protein_per_unit": 0.0,
+        "carbs_per_unit":   0.0,
+        "fat_per_unit":     0.0,
+        "confidence":       "low",
+        "error":            error or True,
+    }]
+
 
 def estimate_nutrition(description: str) -> dict:
     """
-    Estimates calories and macros from a free-text food description.
-    Returns dict with keys: calories, protein_g, carbs_g, fat_g, confidence, note
-    Falls back to safe defaults on any error so the app never breaks.
+    Legacy single-total interface kept for ai_agent internal use only.
+    Sums the component breakdown — math done in Python, not by the LLM.
     """
-    try:
-        raw  = _call(FLASH, NUTRITION_SYSTEM, description, json_mode=True)
-        data = _parse_json(raw)
-
-        # Validate required fields exist and are numeric
-        for key in ("calories", "protein_g", "carbs_g", "fat_g"):
-            data[key] = float(data.get(key) or 0)
-
-        data.setdefault("confidence", "medium")
-        data.setdefault("note", "")
-        return data
-
-    except Exception as e:
-        return {
-            "calories":   0.0,
-            "protein_g":  0.0,
-            "carbs_g":    0.0,
-            "fat_g":      0.0,
-            "confidence": "low",
-            "note":       f"Tahmin yapılamadı: {str(e)}",
-            "error":      True,
-        }
+    components = parse_ingredients(description)
+    calories  = sum(c["calories_per_unit"]  * c["quantity"] for c in components)
+    protein_g = sum(c["protein_per_unit"]   * c["quantity"] for c in components)
+    carbs_g   = sum(c["carbs_per_unit"]     * c["quantity"] for c in components)
+    fat_g     = sum(c["fat_per_unit"]       * c["quantity"] for c in components)
+    has_error  = any(c.get("error") for c in components)
+    confidence = "low" if has_error else (
+        "high" if all(c["confidence"] == "high" for c in components) else "medium"
+    )
+    return {
+        "calories":   round(calories,  1),
+        "protein_g":  round(protein_g, 1),
+        "carbs_g":    round(carbs_g,   1),
+        "fat_g":      round(fat_g,     1),
+        "confidence": confidence,
+        "note":       "",
+        "error":      has_error,
+        "components": components,
+    }
 
 
 # ── 2. Weekly insight summary ─────────────────────────────────────────────────

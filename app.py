@@ -345,103 +345,141 @@ if page == "🏠 Ana Sayfa":
 
 elif page == "🍽️ Yemek Ekle":
     st.markdown("## 🍽️ Yemek Ekle")
-    st.caption("Ne yedin? Hızlıca yaz, ara — bitti!")
+    st.caption("Ne yedin? Yaz, ara — her malzeme ayrı gösterilir, onayladıktan sonra kaydedilir.")
 
     with st.form("food_form", clear_on_submit=False):
         meal_label  = st.selectbox("Öğün / Meal", list(MEAL_TYPES.keys()))
         description = st.text_area(
             "Ne yedin? / What did you eat?",
-            placeholder="örn: 2 köfte, 1 kase pilav, 1 bardak ayran",
+            placeholder="örn: 2 yumurta, 3 dilim pide, biraz beyaz peynir, şekersiz çay",
             height=90,
         )
         searched = st.form_submit_button("🔍 Ara / Look up", use_container_width=True)
 
     # ── Lookup phase ───────────────────────────────────────────────────────────
-    if searched:
-        if not description.strip():
-            st.warning("Lütfen ne yediğini yaz!")
-        else:
-            source_spinner = {
-                "local":         None,
-                "openfoodfacts": "Open Food Facts'te aranıyor...",
-                "ai":            "🤖 AI tahmin ediyor...",
-            }
-            with st.spinner("Besin değerleri aranıyor..."):
-                result = food_db.lookup(description.strip())
+    if searched and description.strip():
+        with st.spinner("Malzemeler ayrıştırılıp aranıyor..."):
+            components = food_db.lookup_multi(description.strip())
+        st.session_state["pending_food"] = {
+            "meal_label":   meal_label,
+            "description":  description.strip(),
+            "components":   components,
+            "manual_mode":  False,
+            "manual_lines": "\n".join(
+                f"{c['quantity']:.0f} {c['unit']} {c['ingredient']}"
+                for c in components
+            ),
+        }
 
-            if result is None:
-                st.error("Hiçbir kaynakta bulunamadı. Lütfen daha detaylı yazar mısın?")
-            else:
-                st.session_state["pending_food"] = {
-                    "meal_label":  meal_label,
-                    "description": description.strip(),
-                    "result":      result,
-                }
-
-    # ── Confirm phase — shown after lookup, before save ────────────────────────
+    # ── Confirm phase ──────────────────────────────────────────────────────────
     if "pending_food" in st.session_state:
-        pf     = st.session_state["pending_food"]
-        result = pf["result"]
+        pf = st.session_state["pending_food"]
 
-        source_badge = {
-            "local":         "📦 Yerel veritabanı",
-            "openfoodfacts": "🌍 Open Food Facts",
-            "ai":            "🤖 AI tahmini",
-        }.get(result["source"], result["source"])
+        # Manual split mode — user edits the ingredient list
+        if pf["manual_mode"]:
+            st.markdown('<div class="section-title">✏️ Malzemeleri Düzenle</div>', unsafe_allow_html=True)
+            st.caption("Her satıra bir malzeme yaz. Örn: '2 yumurta', '1 kase pilav'")
+            edited = st.text_area(
+                "Malzemeler",
+                value=pf["manual_lines"],
+                height=160,
+                label_visibility="collapsed",
+            )
+            col_re, col_back = st.columns(2)
+            with col_re:
+                if st.button("🔍 Yeniden Ara", use_container_width=True, type="primary"):
+                    lines = [l for l in edited.strip().splitlines() if l.strip()]
+                    with st.spinner("Yeniden aranıyor..."):
+                        new_components = food_db.lookup_multi_from_list(lines)
+                    st.session_state["pending_food"]["components"]   = new_components
+                    st.session_state["pending_food"]["manual_lines"] = edited
+                    st.session_state["pending_food"]["manual_mode"]  = False
+                    st.rerun()
+            with col_back:
+                if st.button("← Geri", use_container_width=True):
+                    st.session_state["pending_food"]["manual_mode"] = False
+                    st.rerun()
 
-        conf_icon = {"high": "✅", "medium": "🟡", "low": "⚠️"}.get(result["confidence"], "🟡")
+        else:
+            components = pf["components"]
+            totals     = food_db.sum_components(components)
 
-        st.markdown('<div class="section-title">Sonuç — Onaylar mısın?</div>', unsafe_allow_html=True)
-        st.markdown(f"""
-        <div class="metric-card">
-            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem">
-                <span style="font-weight:600">{result['name']}</span>
-                <span style="font-size:0.78rem; color:#888">{source_badge} {conf_icon}</span>
-            </div>
-            <div style="font-size:1.6rem; font-weight:700; color:#F4A261">
-                {result['calories']:.0f} <span style="font-size:0.95rem; font-weight:400; color:#888">kcal</span>
-            </div>
-            <div style="font-size:0.85rem; color:#888; margin-top:0.3rem">
-                {result['portion_label']} &nbsp;·&nbsp;
-                🥩 {result['protein_g']:.0f}g protein &nbsp;·&nbsp;
-                🍞 {result['carbs_g']:.0f}g karb &nbsp;·&nbsp;
-                🧈 {result['fat_g']:.0f}g yağ
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Malzeme Dökümü — Onaylar mısın?</div>', unsafe_allow_html=True)
 
-        # Allow calorie override if she disagrees
-        override_cal = st.number_input(
-            "Kaloriyi düzelt (isteğe bağlı) / Override calories",
-            min_value=0,
-            max_value=5000,
-            value=int(result["calories"]),
-            step=10,
-            help="Hesaplanan değer yanlışsa buradan düzeltebilirsin.",
-        )
+            # Per-ingredient rows
+            SOURCE_BADGE = {
+                "cache":         "📦",
+                "openfoodfacts": "🌍",
+                "ai":            "🤖",
+            }
+            CONF_ICON = {"high": "✅", "medium": "🟡", "low": "⚠️"}
 
-        col_yes, col_no = st.columns(2)
-        with col_yes:
-            if st.button("✅ Kaydet / Save", use_container_width=True, type="primary"):
-                meal_type = MEAL_TYPES[pf["meal_label"]]
-                db.log_food(
-                    meal_type  = meal_type,
-                    description= pf["description"],
-                    calories   = float(override_cal),
-                    protein_g  = result["protein_g"],
-                    carbs_g    = result["carbs_g"],
-                    fat_g      = result["fat_g"],
-                )
-                suspicion = check_suspicious_entry(pf["description"], float(override_cal), meal_type)
-                del st.session_state["pending_food"]
-                st.success(f"Kaydedildi — {override_cal} kcal eklendi.")
-                if suspicion:
-                    st.info(f"💬 {suspicion}")
-                st.rerun()
-        with col_no:
-            if st.button("❌ İptal / Cancel", use_container_width=True):
-                del st.session_state["pending_food"]
-                st.rerun()
+            for c in components:
+                badge    = SOURCE_BADGE.get(c["source"], "")
+                conf     = CONF_ICON.get(c["confidence"], "🟡")
+                err_flag = " ⚠️ bulunamadı" if c.get("error") else ""
+                st.markdown(f"""
+                <div class="food-row" style="margin-bottom:0.3rem">
+                    <div>
+                        <div class="food-desc">
+                            {c['quantity']:.0f} {c['unit']} {c['ingredient']}
+                            <span style="font-size:0.75rem;color:#aaa"> {badge}{conf}{err_flag}</span>
+                        </div>
+                        <div class="food-meta">
+                            {c['calories_per_unit']:.0f} kcal/{c['unit']} &nbsp;·&nbsp;
+                            🥩 {c['protein_per_unit']:.1f}g &nbsp;·&nbsp;
+                            🍞 {c['carbs_per_unit']:.1f}g &nbsp;·&nbsp;
+                            🧈 {c['fat_per_unit']:.1f}g
+                        </div>
+                    </div>
+                    <div class="food-kcal">{c['calories']:.0f}</div>
+                </div>""", unsafe_allow_html=True)
+
+            # Totals row — summed in Python
+            st.markdown(f"""
+            <div class="metric-card" style="padding:0.8rem 1rem; margin-top:0.4rem">
+                <div style="display:flex; justify-content:space-between; align-items:center">
+                    <span style="font-weight:600; font-size:0.9rem">Toplam / Total</span>
+                    <span style="font-size:1.5rem; font-weight:700; color:#F4A261">
+                        {totals['calories']:.0f} kcal
+                    </span>
+                </div>
+                <div style="font-size:0.85rem; color:#888; margin-top:0.3rem">
+                    🥩 {totals['protein_g']:.0f}g protein &nbsp;·&nbsp;
+                    🍞 {totals['carbs_g']:.0f}g karb &nbsp;·&nbsp;
+                    🧈 {totals['fat_g']:.0f}g yağ
+                </div>
+            </div>""", unsafe_allow_html=True)
+
+            # Action buttons
+            col_save, col_split, col_cancel = st.columns([3, 2, 2])
+            with col_save:
+                if st.button("✅ Kaydet / Save", use_container_width=True, type="primary"):
+                    meal_type = MEAL_TYPES[pf["meal_label"]]
+                    db.log_food(
+                        meal_type   = meal_type,
+                        description = pf["description"],
+                        calories    = totals["calories"],
+                        protein_g   = totals["protein_g"],
+                        carbs_g     = totals["carbs_g"],
+                        fat_g       = totals["fat_g"],
+                    )
+                    suspicion = check_suspicious_entry(
+                        pf["description"], totals["calories"], meal_type
+                    )
+                    del st.session_state["pending_food"]
+                    st.success(f"Kaydedildi — {totals['calories']:.0f} kcal eklendi.")
+                    if suspicion:
+                        st.info(f"💬 {suspicion}")
+                    st.rerun()
+            with col_split:
+                if st.button("✏️ Düzenle", use_container_width=True):
+                    st.session_state["pending_food"]["manual_mode"] = True
+                    st.rerun()
+            with col_cancel:
+                if st.button("❌ İptal", use_container_width=True):
+                    del st.session_state["pending_food"]
+                    st.rerun()
 
 
     # Show today's entries below the form
