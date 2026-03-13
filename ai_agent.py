@@ -21,8 +21,8 @@ def _client():
     return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 
-FLASH = "gemini-2.0-flash"
-PRO   = "gemini-2.0-flash"
+FLASH = "gemini-2.5-flash"
+PRO   = "gemini-2.5-flash"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
