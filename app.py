@@ -314,12 +314,12 @@ if page == "🏠 Ana Sayfa":
         st.info("Henüz kilo girişi yok. ⚖️ Kilo Ekle sayfasından başlayabilirsin!")
 
     # ── Crisis / late-night chat ───────────────────────────────────────────────
-    st.markdown('<div class="section-title">🆘 Diyetisyene Sor / Ask the Coach</div>', unsafe_allow_html=True)
-    st.caption("Gece acıktın mı? Dİyet yapmaktan sıkıldın mı? Yaz, yanıt versin.")
+    st.markdown('<div class="section-title">🆘 Koça Sor / Ask the Coach</div>', unsafe_allow_html=True)
+    st.caption("Gece acıktın mı? Diyet bunalımında mısın? Yaz, yanıt verelim.")
 
     crisis_input = st.text_input(
-        "",
-        placeholder="Canım tatlı istiyor ne yapabilirim?",
+        "Koça yaz / Write to coach",
+        placeholder="örn: saat 01:00, çok acıktım ne yiyebilirim?",
         label_visibility="collapsed",
         key="crisis_input",
     )
@@ -350,7 +350,7 @@ elif page == "🍽️ Yemek Ekle":
         meal_label = st.selectbox("Öğün / Meal", list(MEAL_TYPES.keys()))
         description = st.text_area(
             "Ne yedin? / What did you eat?",
-            placeholder="Mesela 2 köfte, pilav, bir bardak ayran ve bir küçük kase salata",
+            placeholder="örn: 2 köfte, pilav, ayran ve biraz salata",
             height=90,
         )
         calories = st.number_input(
@@ -427,13 +427,14 @@ elif page == "🍽️ Yemek Ekle":
             meal_emoji = {"breakfast":"🌅","lunch":"☀️","dinner":"🌙","snack":"🍎"}.get(entry["meal_type"], "🍴")
             col1, col2 = st.columns([5, 1])
             with col1:
+                kcal_str = f"{entry['calories']:.0f} kcal" if entry['calories'] is not None else "hesaplanıyor…"
                 st.markdown(f"""
                 <div class="food-row">
                     <div>
                         <div class="food-desc">{meal_emoji} {entry['description']}</div>
                         <div class="food-meta">{entry['meal_type'].capitalize()} · girildi: {entry['created_at'][11:16]}</div>
                     </div>
-                    <div class="food-kcal">{entry['calories']:.0f} kcal</div>
+                    <div class="food-kcal">{kcal_str}</div>
                 </div>
                 """, unsafe_allow_html=True)
             with col2:
@@ -517,13 +518,14 @@ elif page == "📊 Geçmiş":
             total = sum(e["calories"] or 0 for e in food_logs)
             for entry in food_logs:
                 meal_emoji = {"breakfast":"🌅","lunch":"☀️","dinner":"🌙","snack":"🍎"}.get(entry["meal_type"], "🍴")
+                kcal_str = f"{entry['calories']:.0f} kcal" if entry['calories'] is not None else "—"
                 st.markdown(f"""
                 <div class="food-row">
                     <div>
                         <div class="food-desc">{meal_emoji} {entry['description']}</div>
                         <div class="food-meta">{entry['meal_type'].capitalize()} · {entry['created_at'][:16]}</div>
                     </div>
-                    <div class="food-kcal">{entry['calories']:.0f} kcal</div>
+                    <div class="food-kcal">{kcal_str}</div>
                 </div>
                 """, unsafe_allow_html=True)
             st.markdown(f"**Toplam / Total: {total:.0f} kcal**")

@@ -12,28 +12,32 @@ API key: st.secrets["GEMINI_API_KEY"]
 import json
 import re
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
 def _client():
-    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 
 FLASH = "gemini-2.0-flash"
-PRO   = "gemini-2.5-pro"
+PRO   = "gemini-2.5-pro-preview-05-06"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _call(model: str, system: str, user: str, json_mode: bool = False) -> str:
     """Single-turn call. Returns raw text response."""
-    _client()
-    m = genai.GenerativeModel(
-        model_name=model,
+    client = _client()
+    config = types.GenerateContentConfig(
         system_instruction=system,
+        response_mime_type="application/json" if json_mode else "text/plain",
     )
-    config = {"response_mime_type": "application/json"} if json_mode else {}
-    response = m.generate_content(user, generation_config=config)
+    response = client.models.generate_content(
+        model=model,
+        contents=user,
+        config=config,
+    )
     return response.text.strip()
 
 
