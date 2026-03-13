@@ -22,7 +22,7 @@ def _client():
 
 
 FLASH = "gemini-2.0-flash"
-PRO   = "gemini-2.5-pro-preview-05-06"
+PRO   = "gemini-2.0-flash"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
